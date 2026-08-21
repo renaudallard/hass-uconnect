@@ -179,39 +179,36 @@ class SocEstimationState:
 
 
 def select_time_to_full(
-    charging_level: str | int | None,
+    charging_level: int | None,
+    time_l1: float | None,
     time_l2: float | None,
     time_l3: float | None,
 ) -> float | None:
     """Select the appropriate time-to-full value based on charging_level.
 
-    Uses the charging_level sensor to determine which charger is connected,
-    falling back to heuristics if not available.
+    The library reports the level as an integer: 1 for a domestic socket, 2
+    for AC and 3 for DC. Falls back to the shortest value on offer when the
+    level is unknown, that being the most likely active charger.
     """
-    valid_l2 = time_l2 is not None and time_l2 > 0
-    valid_l3 = time_l3 is not None and time_l3 > 0
+    times: dict[int, float | None] = {1: time_l1, 2: time_l2, 3: time_l3}
 
-    # Use charging_level to select the right time-to-full
     if charging_level is not None:
-        # Handle both int and string types
-        level_str = str(charging_level).upper()
-        if "3" in level_str or "DC" in level_str or "FAST" in level_str:
-            if valid_l3:
-                return time_l3
-        elif "2" in level_str or "AC" in level_str:
-            if valid_l2:
-                return time_l2
+        selected = times.get(charging_level)
+        if selected is not None and selected > 0:
+            return selected
 
-    # Fallback: use whichever is available
-    if valid_l2 and valid_l3:
-        # Both available - use the smaller one (likely the active charger)
-        assert time_l2 is not None and time_l3 is not None
-        return min(time_l2, time_l3)
-    elif valid_l3:
-        return time_l3
-    elif valid_l2:
-        return time_l2
-    return None
+    valid = [t for t in times.values() if t is not None and t > 0]
+    return min(valid) if valid else None
+
+
+def vehicle_time_to_full(vehicle: Vehicle) -> float | None:
+    """Return the time-to-full for the charger the vehicle reports."""
+    return select_time_to_full(
+        getattr(vehicle, "charging_level", None),
+        getattr(vehicle, "time_to_fully_charge_l1", None),
+        getattr(vehicle, "time_to_fully_charge_l2", None),
+        getattr(vehicle, "time_to_fully_charge_l3", None),
+    )
 
 
 def calculate_charging_rate(
@@ -397,14 +394,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         current_soc = getattr(self.vehicle, "state_of_charge", None)
         is_charging = getattr(self.vehicle, "charging", False) or False
         ignition_on = getattr(self.vehicle, "ignition_on", False) or False
-        charging_level = getattr(self.vehicle, "charging_level", None)
-        time_to_full_l2 = getattr(self.vehicle, "time_to_fully_charge_l2", None)
-        time_to_full_l3 = getattr(self.vehicle, "time_to_fully_charge_l3", None)
-
-        # Select the appropriate time-to-full based on charging_level sensor
-        time_to_full = select_time_to_full(
-            charging_level, time_to_full_l2, time_to_full_l3
-        )
+        time_to_full = vehicle_time_to_full(self.vehicle)
 
         now = datetime.now(timezone.utc)
 
@@ -867,13 +857,7 @@ class UconnectChargingRateSensor(SensorEntity, UconnectEntity):
         if current_soc is None:
             return None
 
-        charging_level = getattr(self.vehicle, "charging_level", None)
-        time_to_full_l2 = getattr(self.vehicle, "time_to_fully_charge_l2", None)
-        time_to_full_l3 = getattr(self.vehicle, "time_to_fully_charge_l3", None)
-
-        time_to_full = select_time_to_full(
-            charging_level, time_to_full_l2, time_to_full_l3
-        )
+        time_to_full = vehicle_time_to_full(self.vehicle)
 
         if time_to_full is None:
             return None
