@@ -53,9 +53,10 @@ MAX_IDLE_DRAIN_RATE = 0.04  # Maximum drain rate (0.04%/hour ≈ 1%/day)
 MIN_IDLE_TIME_FOR_LEARNING_HOURS = 1.0  # Minimum 1 hour idle for learning drain rate
 IDLE_DRAIN_EMA_ALPHA = 0.2  # Slower learning for drain rate (less frequent data points)
 
-# Constants for deep refresh on charging transition
-MAX_DEEP_REFRESH_RETRIES = 3  # Maximum retry attempts for deep refresh
-DEEP_REFRESH_RETRY_SECONDS = 3600  # Retry interval (1 hour)
+# Constants for deep refresh scheduling
+# The vehicle settles on a time-to-full for the connected charger only a
+# couple of minutes after being plugged in
+CHARGE_START_REFRESH_DELAY = timedelta(minutes=3)
 
 
 @dataclass
@@ -265,7 +266,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
 
         self._state = SocEstimationState()
         self._unsub_timer: Callable[[], None] | None = None
-        self._unsub_deep_refresh_retry: Callable[[], None] | None = None
+        self._unsub_deep_refresh: Callable[[], None] | None = None
         self._has_session_rate: bool = False
 
     async def async_added_to_hass(self) -> None:
@@ -302,9 +303,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         if self._unsub_timer:
             self._unsub_timer()
             self._unsub_timer = None
-        if self._unsub_deep_refresh_retry:
-            self._unsub_deep_refresh_retry()
-            self._unsub_deep_refresh_retry = None
+        self._cancel_deep_refresh()
         await super().async_will_remove_from_hass()
 
     @callback
@@ -323,49 +322,34 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         ):
             self.async_write_ha_state()
 
-    async def _async_do_deep_refresh(self, attempt: int) -> None:
-        """Execute deep refresh with retry on failure."""
-        _LOGGER.info(
-            "Triggering deep refresh for %s (attempt %d/%d)",
-            self.vehicle.vin,
-            attempt,
-            MAX_DEEP_REFRESH_RETRIES,
-        )
+    async def _async_do_deep_refresh(self) -> None:
+        """Ask the vehicle to push fresh data."""
+        _LOGGER.info("Triggering deep refresh for %s", self._vin)
         try:
-            await self.coordinator.async_command(self.vehicle.vin, COMMAND_DEEP_REFRESH)
+            await self.coordinator.async_command(self._vin, COMMAND_DEEP_REFRESH)
         except Exception as err:
-            _LOGGER.warning(
-                "Deep refresh failed for %s (attempt %d/%d): %s",
-                self.vehicle.vin,
-                attempt,
-                MAX_DEEP_REFRESH_RETRIES,
-                err,
-            )
-            if attempt < MAX_DEEP_REFRESH_RETRIES:
-                self._schedule_deep_refresh_retry(attempt + 1)
+            _LOGGER.warning("Deep refresh failed for %s: %s", self._vin, err)
 
     @callback
-    def _schedule_deep_refresh_retry(self, next_attempt: int) -> None:
-        """Schedule a deep refresh retry after an interval."""
+    def _cancel_deep_refresh(self) -> None:
+        """Cancel a pending deep refresh."""
+        if self._unsub_deep_refresh:
+            self._unsub_deep_refresh()
+            self._unsub_deep_refresh = None
+
+    @callback
+    def _schedule_deep_refresh(self, delay: timedelta) -> None:
+        """Schedule a deep refresh after the given delay."""
 
         @callback
-        def _retry(_now: datetime) -> None:
-            self._unsub_deep_refresh_retry = None
-            self.hass.async_create_task(self._async_do_deep_refresh(next_attempt))
+        def _fire(_now: datetime) -> None:
+            self._unsub_deep_refresh = None
+            if not self._state.is_charging:
+                return
+            self.hass.async_create_task(self._async_do_deep_refresh())
 
-        if self._unsub_deep_refresh_retry:
-            self._unsub_deep_refresh_retry()
-        self._unsub_deep_refresh_retry = async_call_later(
-            self.hass,
-            DEEP_REFRESH_RETRY_SECONDS,
-            _retry,
-        )
-        _LOGGER.info(
-            "Scheduled deep refresh retry %d/%d in 1 hour for %s",
-            next_attempt,
-            MAX_DEEP_REFRESH_RETRIES,
-            self.vehicle.vin,
-        )
+        self._cancel_deep_refresh()
+        self._unsub_deep_refresh = async_call_later(self.hass, delay, _fire)
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -549,15 +533,14 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         # Default target SOC to 100% (no target SOC limit for this vehicle type)
         self._state.target_soc = 100.0
 
-        # Trigger deep refresh whenever charging starts, for fresh SOC data.
-        # Plugging in right after a drive leaves the ignition on at the
-        # previous poll, so keying this on the idle state missed those sessions
+        # Deep refresh a few minutes after charging starts, once the vehicle
+        # has settled on a time-to-full for the connected charger. Refreshing
+        # at the very moment the charging flag appears returns the estimate
+        # the vehicle held before the charger was negotiated
         if self._state.is_charging and not was_charging:
-            _LOGGER.info(
-                "Charging started for %s, triggering deep refresh",
-                self._vin,
-            )
-            self.hass.async_create_task(self._async_do_deep_refresh(1))
+            self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
+        elif was_charging and not self._state.is_charging:
+            self._cancel_deep_refresh()
 
     def _learn_correction_factor(
         self,
