@@ -843,7 +843,10 @@ class UconnectChargingRateSensor(SensorEntity, UconnectEntity):
             oldest_time, oldest_soc = self._soc_history[0]
             elapsed_hours = (now - oldest_time).total_seconds() / 3600.0
             delta = current_soc - oldest_soc
-            if elapsed_hours >= MIN_TIME_FOR_LEARNING_HOURS and delta >= 0:
+            # A flat window means the API has not given us a new reading yet,
+            # not that charging has stopped. Publishing the 0%/h it computes
+            # would also suppress the time-to-full fallback below
+            if elapsed_hours >= MIN_TIME_FOR_LEARNING_HOURS and delta > 0:
                 self._observed_rate = min(delta / elapsed_hours, 300.0)
 
         self.async_write_ha_state()
