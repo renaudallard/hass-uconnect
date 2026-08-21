@@ -115,7 +115,7 @@ The options are:
 
 - **Scan Interval (min)**: how often the integration polls the API, 5 minutes by default
 - **Pin**: needed to issue remote commands, set it here if it was left empty during setup
-- **Deep Refresh While Charging (min, 0 disables, 15 minimum)**: how often to ask an EV to push fresh data while it is charging, 30 minutes by default. Polling alone returns a cached state of charge, so without this the extrapolated battery has nothing to correct itself against. Set it to 0 to only refresh once at the start of a charge. Requires a PIN and a vehicle that supports deep refresh
+- **Deep Refresh While Charging (min, 0 disables, 15 minimum)**: how often to ask an EV to push fresh data while it is charging, 30 minutes by default. Polling alone returns a cached state of charge, so without this the extrapolated battery has nothing to correct itself against. Set it to 0 to only refresh once at the start of a charge. Requires a PIN and a vehicle that supports deep refresh. Three failures in a row end the refreshes for that session, since a vehicle that does not answer holds the request open for a minute each time
 - **Add command entities (Button/Lock/Switch)**: create entities for the remote commands instead of using actions only
 
 ## Built-in Vehicle Card

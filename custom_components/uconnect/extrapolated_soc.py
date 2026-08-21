@@ -57,6 +57,9 @@ IDLE_DRAIN_EMA_ALPHA = 0.2  # Slower learning for drain rate (less frequent data
 # The vehicle settles on a time-to-full for the connected charger only a
 # couple of minutes after being plugged in
 CHARGE_START_REFRESH_DELAY = timedelta(minutes=3)
+# A command the vehicle never answers ties up the status poll for a minute and
+# some thirty requests, so stop trying once it is clearly not listening
+MAX_DEEP_REFRESH_FAILURES = 3
 
 
 @dataclass
@@ -267,6 +270,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         self._state = SocEstimationState()
         self._unsub_timer: Callable[[], None] | None = None
         self._unsub_deep_refresh: Callable[[], None] | None = None
+        self._deep_refresh_failures: int = 0
 
     async def async_added_to_hass(self) -> None:
         """Restore state when added to hass."""
@@ -331,8 +335,16 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         _LOGGER.info("Triggering deep refresh for %s", self._vin)
         try:
             await self.coordinator.async_command(self._vin, COMMAND_DEEP_REFRESH)
+            self._deep_refresh_failures = 0
         except Exception as err:
-            _LOGGER.warning("Deep refresh failed for %s: %s", self._vin, err)
+            self._deep_refresh_failures += 1
+            _LOGGER.warning(
+                "Deep refresh failed for %s (%d/%d): %s",
+                self._vin,
+                self._deep_refresh_failures,
+                MAX_DEEP_REFRESH_FAILURES,
+                err,
+            )
             # The status poll gives up after a minute, which the vehicle can
             # outlast, and the coordinator is only refreshed on success. Read
             # the data back so a slow but successful refresh is not wasted
@@ -374,6 +386,14 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         def _fire(_now: datetime) -> None:
             self._unsub_deep_refresh = None
             if not self._state.is_charging:
+                return
+            if self._deep_refresh_failures >= MAX_DEEP_REFRESH_FAILURES:
+                _LOGGER.warning(
+                    "Giving up on deep refresh for %s after %d consecutive "
+                    "failures, will try again on the next charging session",
+                    self._vin,
+                    self._deep_refresh_failures,
+                )
                 return
             interval = self.coordinator.charging_refresh_interval
             if interval:
@@ -578,6 +598,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         # at the very moment the charging flag appears returns the estimate
         # the vehicle held before the charger was negotiated
         if self._state.is_charging and not was_charging:
+            self._deep_refresh_failures = 0
             self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
         elif was_charging and not self._state.is_charging:
             self._cancel_deep_refresh()
