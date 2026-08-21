@@ -520,6 +520,17 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                         elapsed_hours,
                     )
 
+        # Restart the measurement window when charging starts, so the first
+        # observed rate is not diluted by the time that passed before the car
+        # was plugged in. Driving to charging leaves the baseline stamped at
+        # the last reading of the drive, which can be well over an hour old
+        if (
+            self._state.is_charging
+            and not was_charging
+            and self._state.last_actual_soc is not None
+        ):
+            self._state.last_actual_soc_time = now
+
         # Calculate charging rate if charging with valid data
         # Don't recalculate if we detected stale charging data
         # Skip when current_soc is None to preserve restored rate after reboot
