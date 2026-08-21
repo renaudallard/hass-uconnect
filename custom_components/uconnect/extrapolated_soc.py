@@ -335,6 +335,24 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         except Exception as err:
             _LOGGER.warning("Deep refresh failed for %s: %s", self._vin, err)
 
+    def _can_deep_refresh(self) -> bool:
+        """Check whether an automatic deep refresh can reach the vehicle.
+
+        The command is authenticated with the PIN, which is optional, and is
+        not offered by every vehicle. Every other caller checks this, so
+        without it a charge on an unsupported account queues a command that
+        can only fail.
+        """
+
+        if not self.coordinator.client.api.pin:
+            return False
+
+        vehicle = self.coordinator.client.get_vehicles().get(self._vin)
+        if vehicle is None:
+            return False
+
+        return COMMAND_DEEP_REFRESH.name in vehicle.supported_commands
+
     @callback
     def _cancel_deep_refresh(self) -> None:
         """Cancel a pending deep refresh."""
@@ -345,6 +363,9 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
     @callback
     def _schedule_deep_refresh(self, delay: timedelta) -> None:
         """Schedule a deep refresh after the given delay."""
+
+        if not self._can_deep_refresh():
+            return
 
         @callback
         def _fire(_now: datetime) -> None:
