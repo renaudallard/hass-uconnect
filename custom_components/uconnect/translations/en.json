@@ -32,6 +32,7 @@
                 "title": "API Configuration",
                 "data": {
                     "scan_interval": "Scan Interval (min)",
+                    "pin": "Pin",
                     "charging_refresh_interval": "Deep Refresh While Charging (min, 0 disables, 15 minimum)",
                     "add_command_entities": "Add command entities (Button/Lock/Switch)"
                 }
