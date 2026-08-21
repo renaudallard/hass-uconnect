@@ -549,11 +549,13 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         # Default target SOC to 100% (no target SOC limit for this vehicle type)
         self._state.target_soc = 100.0
 
-        # Trigger deep refresh on idle-to-charging transition for fresh SOC data
-        if was_idle and not was_charging and self._state.is_charging:
+        # Trigger deep refresh whenever charging starts, for fresh SOC data.
+        # Plugging in right after a drive leaves the ignition on at the
+        # previous poll, so keying this on the idle state missed those sessions
+        if self._state.is_charging and not was_charging:
             _LOGGER.info(
-                "Idle-to-charging transition for %s, triggering deep refresh",
-                self.vehicle.vin,
+                "Charging started for %s, triggering deep refresh",
+                self._vin,
             )
             self.hass.async_create_task(self._async_do_deep_refresh(1))
 
