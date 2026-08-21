@@ -392,11 +392,14 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             is_idle = not is_charging and not ignition_on
 
             # Physical constraint: SOC cannot drop while already charging
-            # Uses stored state (was already charging) not current API state,
-            # so idle→charging transitions with lower SOC from idle drain are accepted
+            # Requires the stored state (was already charging) so that
+            # idle→charging transitions with lower SOC from idle drain are
+            # accepted, and the reported state (still charging) so that a drop
+            # after the charger was unplugged is not rejected forever
             if (
                 soc_changed
                 and self._state.is_charging  # Was already charging
+                and is_charging  # And still is
                 and self._state.last_actual_soc is not None
                 and current_soc < self._state.last_actual_soc
             ):
