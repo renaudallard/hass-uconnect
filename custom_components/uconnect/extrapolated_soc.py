@@ -71,6 +71,7 @@ class SocEstimationState:
     is_charging: bool = False
     is_idle: bool = False  # Not charging and ignition off
     charging_rate_pct_per_hour: float = 0.0
+    has_measured_rate: bool = False  # Rate came from observed SOC changes
     idle_drain_rate_pct_per_hour: float = DEFAULT_IDLE_DRAIN_RATE
     learned_correction_factor: float = DEFAULT_CORRECTION_FACTOR
     target_soc: float = 100.0
@@ -88,6 +89,7 @@ class SocEstimationState:
             "is_charging": self.is_charging,
             "is_idle": self.is_idle,
             "charging_rate_pct_per_hour": self.charging_rate_pct_per_hour,
+            "has_measured_rate": self.has_measured_rate,
             "idle_drain_rate_pct_per_hour": self.idle_drain_rate_pct_per_hour,
             "learned_correction_factor": self.learned_correction_factor,
             "target_soc": self.target_soc,
@@ -169,6 +171,7 @@ class SocEstimationState:
             is_charging=bool(data.get("is_charging", False)),
             is_idle=bool(data.get("is_idle", False)),
             charging_rate_pct_per_hour=float(charging_rate),
+            has_measured_rate=bool(data.get("has_measured_rate", False)),
             idle_drain_rate_pct_per_hour=float(drain_rate),
             learned_correction_factor=float(correction),
             target_soc=float(target_soc),
@@ -267,7 +270,6 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         self._state = SocEstimationState()
         self._unsub_timer: Callable[[], None] | None = None
         self._unsub_deep_refresh: Callable[[], None] | None = None
-        self._has_session_rate: bool = False
 
     async def async_added_to_hass(self) -> None:
         """Restore state when added to hass."""
@@ -548,23 +550,24 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                         self._state.charging_rate_pct_per_hour = min(
                             (current_soc - prev_soc) / elapsed, 300.0
                         )
-                        self._has_session_rate = True
-                elif not self._has_session_rate and time_to_full is not None:
-                    # Use time-to-full estimate when no observed rate is
-                    # available yet this session. This also overrides any
-                    # stale rate carried over from a previous session.
+                        self._state.has_measured_rate = True
+                elif not self._state.has_measured_rate and time_to_full is not None:
+                    # Track the time-to-full estimate until an observed rate is
+                    # available. This also overrides any stale rate carried
+                    # over from a previous session. The value the vehicle
+                    # reports at plug-in is often a placeholder, so keep taking
+                    # the latest one rather than locking in the first.
                     # Only accept a positive rate so that a zero return
-                    # (e.g. time_to_full < 1 min) does not lock out retries
-                    # or discard a usable stale fallback.
+                    # (e.g. time_to_full < 1 min) does not discard a usable
+                    # stale fallback.
                     rate = calculate_charging_rate(current_soc, time_to_full)
                     if rate > 0:
                         self._state.charging_rate_pct_per_hour = rate
-                        self._has_session_rate = True
             else:
-                # Reset session flag so the next charging session can
-                # pick up a fresh time-to-full estimate. The rate itself
-                # is preserved as a fallback for the next session.
-                self._has_session_rate = False
+                # Reset the flag so the next charging session can pick up a
+                # fresh time-to-full estimate. The rate itself is preserved
+                # as a fallback for the next session.
+                self._state.has_measured_rate = False
 
         # Default target SOC to 100% (no target SOC limit for this vehicle type)
         self._state.target_soc = 100.0
