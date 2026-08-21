@@ -590,11 +590,14 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         """Learn a correction factor by comparing actual vs predicted SOC changes.
 
         This helps account for discrepancies between the vehicle's time-to-full
-        estimate and actual charging behavior.
+        estimate and actual charging behavior. It only applies while the rate
+        comes from that estimate, learning it from a measured rate would drive
+        it towards 1.0 and leave nothing to correct the next estimate with.
         """
         if (
             self._state.last_actual_soc is None
             or not was_charging
+            or self._state.has_measured_rate
             or self._state.charging_rate_pct_per_hour <= 0
         ):
             return
@@ -749,9 +752,15 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         if base_soc >= self._state.target_soc:
             return round(base_soc, 1)
 
-        # Calculate extrapolated SOC for charging
+        # Calculate extrapolated SOC for charging. The correction factor
+        # accounts for the vehicle's time-to-full being optimistic or
+        # pessimistic, so it has nothing to correct on a measured rate
         rate = self._state.charging_rate_pct_per_hour
-        correction = self._state.learned_correction_factor
+        correction = (
+            1.0
+            if self._state.has_measured_rate
+            else self._state.learned_correction_factor
+        )
 
         extrapolated = base_soc + (rate * correction * elapsed_hours)
 
