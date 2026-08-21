@@ -334,6 +334,10 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             await self.coordinator.async_command(self._vin, COMMAND_DEEP_REFRESH)
         except Exception as err:
             _LOGGER.warning("Deep refresh failed for %s: %s", self._vin, err)
+            # The status poll gives up after a minute, which the vehicle can
+            # outlast, and the coordinator is only refreshed on success. Read
+            # the data back so a slow but successful refresh is not wasted
+            await self.coordinator.async_request_refresh()
 
     def _can_deep_refresh(self) -> bool:
         """Check whether an automatic deep refresh can reach the vehicle.
