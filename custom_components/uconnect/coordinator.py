@@ -23,9 +23,12 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
     CONF_BRAND_REGION,
+    CONF_CHARGING_REFRESH_INTERVAL,
     CONF_DISABLE_TLS_VERIFICATION,
     BRANDS,
+    DEFAULT_CHARGING_REFRESH_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
+    MIN_CHARGING_REFRESH_INTERVAL,
     DOMAIN,
 )
 
@@ -67,6 +70,10 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL) * 60
         )
 
+        self.charging_refresh_interval: int = self._read_charging_refresh_interval(
+            config_entry
+        )
+
         super().__init__(
             hass,
             _LOGGER,
@@ -74,6 +81,24 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(seconds=self.refresh_interval),
             always_update=True,
         )
+
+    @staticmethod
+    def _read_charging_refresh_interval(config_entry: ConfigEntry) -> int:
+        """Return the deep refresh interval while charging, in minutes.
+
+        Zero disables the recurring refresh. Shorter intervals are raised to
+        the floor because each deep refresh wakes the vehicle and holds an
+        executor thread for as long as the command status poll takes.
+        """
+
+        minutes = config_entry.options.get(
+            CONF_CHARGING_REFRESH_INTERVAL, DEFAULT_CHARGING_REFRESH_INTERVAL
+        )
+
+        if not isinstance(minutes, int) or minutes <= 0:
+            return 0
+
+        return max(minutes, MIN_CHARGING_REFRESH_INTERVAL)
 
     async def _async_update_data(self):
         """Update data via library. Called by update_coordinator periodically."""
@@ -165,4 +190,7 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         self.update_interval = timedelta(
             seconds=config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
             * 60
+        )
+        self.charging_refresh_interval = self._read_charging_refresh_interval(
+            config_entry
         )

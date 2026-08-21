@@ -39,7 +39,7 @@ US, Canada, EU & Asia regions are supported. Try a different region if the origi
 
 - Imports statistics like battery level 🔋, tire pressure ‍💨, odometer ⏲, fuel type, vehicle health report, maintenance history, stolen vehicle status etc. into Home Assistant
 - **Vehicle Image**: Displays your vehicle's image as an entity. The image is downloaded once and cached locally for fast access
-- **Extrapolated Battery**: For EVs, provides a real-time battery estimate between API updates by tracking charging rate and idle drain. Automatically rejects stale data that would show impossible values (e.g., battery dropping while charging), and correctly handles state transitions (e.g., idle to charging, charging to driving). Triggers an automatic deep refresh three minutes after charging starts, once the vehicle has settled on a time-to-full for the connected charger. Preserves the charging rate across sessions so that extrapolation begins immediately when a new charging session starts, even before time-to-full data is available from the API
+- **Extrapolated Battery**: For EVs, provides a real-time battery estimate between API updates by tracking charging rate and idle drain. Automatically rejects stale data that would show impossible values (e.g., battery dropping while charging), and correctly handles state transitions (e.g., idle to charging, charging to driving). Triggers an automatic deep refresh three minutes after charging starts, once the vehicle has settled on a time-to-full for the connected charger, then repeats it at the configured interval for as long as the session lasts. Without those refreshes the API returns the same cached SOC for hours and the estimate runs open loop. Preserves the charging rate across sessions so that extrapolation begins immediately when a new charging session starts, even before time-to-full data is available from the API
 - **Charging Rate**: Shows the current charging speed in %/hour. Computed over a 60-minute sliding window of SOC readings for stable output even with integer SOC values and irregular polling. Falls back to a time-to-full estimate during the first hour of a session
 - **Reset Battery Learning**: Button to reset the learned charging correction factor and idle drain rate back to defaults. Useful when changing chargers or if learned values have drifted
 - Multiple Brands: Abarth, Alfa Romeo, Chrysler, Dodge, Fiat, Jeep, Lancia, Maserati & Ram
@@ -110,6 +110,12 @@ issue with your vehicle year, make, model, and whether it shows in the official 
 After the integration is initialized - you might want to go into its options and enable the creation of command entities:
 
 ![image](https://github.com/user-attachments/assets/587c9ec0-bbd0-4918-b84b-4235316a58cf)
+
+The options are:
+
+- **Scan Interval (min)**: how often the integration polls the API, 5 minutes by default
+- **Deep Refresh While Charging (min, 0 disables, 15 minimum)**: how often to ask an EV to push fresh data while it is charging, 30 minutes by default. Polling alone returns a cached state of charge, so without this the extrapolated battery has nothing to correct itself against. Set it to 0 to only refresh once at the start of a charge. Requires a PIN and a vehicle that supports deep refresh
+- **Add command entities (Button/Lock/Switch)**: create entities for the remote commands instead of using actions only
 
 ## Built-in Vehicle Card
 

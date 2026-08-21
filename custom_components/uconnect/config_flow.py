@@ -26,8 +26,10 @@ from py_uconnect.brands import BRANDS as BRANDS_BY_NAME
 from .const import (
     BRANDS,
     CONF_BRAND_REGION,
+    CONF_CHARGING_REFRESH_INTERVAL,
     CONF_DISABLE_TLS_VERIFICATION,
     CONF_ADD_COMMAND_ENTITIES,
+    DEFAULT_CHARGING_REFRESH_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_PIN,
     DOMAIN,
@@ -52,6 +54,10 @@ OPTIONS_SCHEMA = vol.Schema(
             default=DEFAULT_SCAN_INTERVAL,
         ): vol.All(vol.Coerce(int), vol.Range(min=1, max=999)),
         vol.Optional(CONF_PIN, default=DEFAULT_PIN): str,
+        vol.Required(
+            CONF_CHARGING_REFRESH_INTERVAL,
+            default=DEFAULT_CHARGING_REFRESH_INTERVAL,
+        ): vol.All(vol.Coerce(int), vol.Range(min=0, max=1440)),
         vol.Required(CONF_ADD_COMMAND_ENTITIES): bool,
     }
 )

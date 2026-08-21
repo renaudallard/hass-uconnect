@@ -291,6 +291,11 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         # Initialize with current vehicle state
         self._update_from_vehicle()
 
+        # Resume the deep refresh schedule when Home Assistant restarts during
+        # a charge, the charging state carries over so no transition is seen
+        if self._state.is_charging:
+            self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
+
         # Set up periodic timer for extrapolation updates
         self._unsub_timer = async_track_time_interval(
             self.hass,
@@ -346,6 +351,9 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             self._unsub_deep_refresh = None
             if not self._state.is_charging:
                 return
+            interval = self.coordinator.charging_refresh_interval
+            if interval:
+                self._schedule_deep_refresh(timedelta(minutes=interval))
             self.hass.async_create_task(self._async_do_deep_refresh())
 
         self._cancel_deep_refresh()
