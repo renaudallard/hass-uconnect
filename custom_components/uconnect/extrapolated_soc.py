@@ -870,6 +870,7 @@ class UconnectChargingRateSensor(SensorEntity, UconnectEntity):
 
         self._soc_history: deque[tuple[datetime, float]] = deque()
         self._observed_rate: float | None = None
+        self._observed_rate_time: datetime | None = None
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -880,6 +881,7 @@ class UconnectChargingRateSensor(SensorEntity, UconnectEntity):
         if not is_charging or current_soc is None:
             self._soc_history.clear()
             self._observed_rate = None
+            self._observed_rate_time = None
             self.async_write_ha_state()
             return
 
@@ -901,8 +903,23 @@ class UconnectChargingRateSensor(SensorEntity, UconnectEntity):
             # would also suppress the time-to-full fallback below
             if elapsed_hours >= MIN_TIME_FOR_LEARNING_HOURS and delta > 0:
                 self._observed_rate = min(delta / elapsed_hours, 300.0)
+                self._observed_rate_time = now
 
         self.async_write_ha_state()
+
+    @property
+    def _measurement_is_current(self) -> bool:
+        """Whether the observed rate still describes the window it was taken over.
+
+        Past that it says nothing about the charge now, and a session held at
+        its target would keep reporting the speed it last reached.
+        """
+
+        if self._observed_rate is None or self._observed_rate_time is None:
+            return False
+
+        age = datetime.now(timezone.utc) - self._observed_rate_time
+        return age <= CHARGING_RATE_WINDOW
 
     @property
     def native_value(self) -> float | None:
@@ -912,21 +929,24 @@ class UconnectChargingRateSensor(SensorEntity, UconnectEntity):
             return 0.0
 
         # Prefer observed rate from actual SOC changes
+        if self._measurement_is_current:
+            return round(self._observed_rate, 1)
+
+        # Fall back to time-to-full estimate for initial reading, and again
+        # once the last measurement has aged out
+        current_soc = getattr(self.vehicle, "state_of_charge", None)
+        time_to_full = vehicle_time_to_full(self.vehicle)
+
+        if current_soc is not None and time_to_full is not None:
+            return round(calculate_charging_rate(current_soc, time_to_full), 1)
+
+        # Nothing current on offer. An aged measurement still beats going
+        # unknown, which is what the vehicle leaves us with when it publishes
+        # neither a new state of charge nor a time-to-full
         if self._observed_rate is not None:
             return round(self._observed_rate, 1)
 
-        # Fall back to time-to-full estimate for initial reading
-        current_soc = getattr(self.vehicle, "state_of_charge", None)
-        if current_soc is None:
-            return None
-
-        time_to_full = vehicle_time_to_full(self.vehicle)
-
-        if time_to_full is None:
-            return None
-
-        rate = calculate_charging_rate(current_soc, time_to_full)
-        return round(rate, 1)
+        return None
 
     @property
     def available(self) -> bool:
