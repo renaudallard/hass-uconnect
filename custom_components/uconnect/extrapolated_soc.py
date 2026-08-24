@@ -75,6 +75,7 @@ class SocEstimationState:
     is_idle: bool = False  # Not charging and ignition off
     charging_rate_pct_per_hour: float = 0.0
     has_measured_rate: bool = False  # Rate came from observed SOC changes
+    rate_baseline_stale: bool = False  # Baseline reading predates the charge
     idle_drain_rate_pct_per_hour: float = DEFAULT_IDLE_DRAIN_RATE
     learned_correction_factor: float = DEFAULT_CORRECTION_FACTOR
     target_soc: float = 100.0
@@ -93,6 +94,7 @@ class SocEstimationState:
             "is_idle": self.is_idle,
             "charging_rate_pct_per_hour": self.charging_rate_pct_per_hour,
             "has_measured_rate": self.has_measured_rate,
+            "rate_baseline_stale": self.rate_baseline_stale,
             "idle_drain_rate_pct_per_hour": self.idle_drain_rate_pct_per_hour,
             "learned_correction_factor": self.learned_correction_factor,
             "target_soc": self.target_soc,
@@ -175,6 +177,7 @@ class SocEstimationState:
             is_idle=bool(data.get("is_idle", False)),
             charging_rate_pct_per_hour=float(charging_rate),
             has_measured_rate=bool(data.get("has_measured_rate", False)),
+            rate_baseline_stale=bool(data.get("rate_baseline_stale", False)),
             idle_drain_rate_pct_per_hour=float(drain_rate),
             learned_correction_factor=float(correction),
             target_soc=float(target_soc),
@@ -549,6 +552,14 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             and not was_charging
             and self._state.last_actual_soc is not None
         ):
+            # Only the time moves, so the state of charge paired with it can
+            # be older than the timestamp now says. Coming from idle that is
+            # harmless, the reading did not move because the car was parked
+            # and the drain lock-in above has already reconciled the pair.
+            # Coming from a drive it is not: the gain since that reading would
+            # all be credited to the short window after the restamp, so wait
+            # for a reading taken while charging before measuring
+            self._state.rate_baseline_stale = not soc_changed and not was_idle
             self._state.last_actual_soc_time = now
 
         # Calculate charging rate if charging with valid data
@@ -562,6 +573,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                 if (
                     was_charging
                     and soc_changed
+                    and not self._state.rate_baseline_stale
                     and prev_soc is not None
                     and prev_soc_time is not None
                     and current_soc - prev_soc >= MIN_SOC_CHANGE_FOR_LEARNING
@@ -584,6 +596,11 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                     rate = calculate_charging_rate(current_soc, time_to_full)
                     if rate > 0:
                         self._state.charging_rate_pct_per_hour = rate
+
+                # This reading was taken while charging, so it can be timed and
+                # the next one measures a rate from it
+                if soc_changed:
+                    self._state.rate_baseline_stale = False
             else:
                 # Reset the flag so the next charging session can pick up a
                 # fresh time-to-full estimate. The rate itself is preserved
@@ -615,10 +632,15 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         estimate and actual charging behavior. It only applies while the rate
         comes from that estimate, learning it from a measured rate would drive
         it towards 1.0 and leave nothing to correct the next estimate with.
+
+        A baseline restamped at charging start is skipped for the same reason
+        the rate measurement skips it: the change since the stored reading did
+        not all happen inside the window the timestamp describes.
         """
         if (
             self._state.last_actual_soc is None
             or not was_charging
+            or self._state.rate_baseline_stale
             or self._state.has_measured_rate
             or self._state.charging_rate_pct_per_hour <= 0
         ):
