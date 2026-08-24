@@ -463,6 +463,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
 
         # Track if we're skipping due to stale charging data
         skip_stale_charging_data = False
+        soc_changed = False
 
         if current_soc is not None:
             # Only update baseline if SOC actually changed
@@ -536,13 +537,16 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             self._state.is_charging = is_charging
             self._state.is_idle = not is_charging and not ignition_on
 
-        # Always try to learn from SOC changes, even if we don't update baseline
-        # This ensures deep refresh data is used for learning drain rate
-        # But skip learning from stale data
+        # Learn from readings the vehicle actually published, which a deep
+        # refresh makes sure of. A reading either guard rejected is stale by
+        # definition, and it is also never consumed: the baseline does not
+        # move, so the same one would be relearned on every poll until the
+        # extrapolation happens to catch up with it, driving an average that
+        # is meant to be slow straight to whatever that single sample says
         if (
             current_soc is not None
             and self._state.last_actual_soc is not None
-            and not skip_stale_charging_data
+            and soc_changed
         ):
             if current_soc != self._state.last_actual_soc:
                 # Learn correction factor from actual vs predicted changes
