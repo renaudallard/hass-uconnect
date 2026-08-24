@@ -320,6 +320,10 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             self._unsub_timer()
             self._unsub_timer = None
         self._cancel_deep_refresh()
+        # Disabling the entity leaves the config entry loaded, so drop the
+        # registration too or the coordinator keeps handing work to an entity
+        # that is no longer part of Home Assistant
+        self.coordinator.extrapolated_soc_sensors.pop(self._vin, None)
         await super().async_will_remove_from_hass()
 
     @callback
@@ -410,6 +414,29 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
 
         self._cancel_deep_refresh()
         self._unsub_deep_refresh = async_call_later(self.hass, delay, _fire)
+
+    @callback
+    def resume_deep_refresh(self) -> None:
+        """Pick the deep refresh back up after the options changed.
+
+        The schedule keeps itself alive from one refresh to the next, so a
+        charge that started with the interval disabled, or without a PIN to
+        authenticate the command, has nothing left to re-arm it and would
+        otherwise wait for the next session.
+        """
+
+        if (
+            self._state.is_charging
+            and self._unsub_deep_refresh is None
+            and self.coordinator.charging_refresh_interval
+        ):
+            # The options may be what the refreshes were failing over, a PIN
+            # the vehicle rejected being the obvious one, so the count of
+            # earlier failures should not bar the retry
+            self._deep_refresh_failures = 0
+            self._schedule_deep_refresh(
+                timedelta(minutes=self.coordinator.charging_refresh_interval)
+            )
 
     @callback
     def _handle_coordinator_update(self) -> None:

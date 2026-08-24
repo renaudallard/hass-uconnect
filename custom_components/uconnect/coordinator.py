@@ -197,3 +197,8 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             config_entry
         )
         self.client.set_pin(self._read_pin(config_entry))
+
+        # A dormant deep refresh schedule has nothing left to re-arm it, so a
+        # charge already under way has to be told the options allow one now
+        for sensor in self.extrapolated_soc_sensors.values():
+            sensor.resume_deep_refresh()
