@@ -19,6 +19,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import PERCENTAGE
 from homeassistant.core import callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import (
     async_call_later,
     async_track_time_interval,
@@ -357,10 +358,13 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                 MAX_DEEP_REFRESH_FAILURES,
                 err,
             )
-            # The status poll gives up after a minute, which the vehicle can
-            # outlast, and the coordinator is only refreshed on success. Read
-            # the data back so a slow but successful refresh is not wasted
-            await self.coordinator.async_request_refresh()
+            # A refusal is still an answer, and a command the vehicle
+            # answered has already been followed by a read. Only one left
+            # unanswered needs another: the status poll gives up after a
+            # minute, which the vehicle can outlast, so a slow but successful
+            # refresh would be wasted
+            if not isinstance(err, HomeAssistantError):
+                await self.coordinator.async_request_refresh()
 
     def _can_deep_refresh(self) -> bool:
         """Check whether an automatic deep refresh can reach the vehicle.
