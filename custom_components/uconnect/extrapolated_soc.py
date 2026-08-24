@@ -74,7 +74,8 @@ class SocEstimationState:
     is_charging: bool = False
     is_idle: bool = False  # Not charging and ignition off
     charging_rate_pct_per_hour: float = 0.0
-    has_measured_rate: bool = False  # Rate came from observed SOC changes
+    has_measured_rate: bool = False  # Stored rate came from observed SOC changes
+    measured_this_session: bool = False  # A rate was measured during this charge
     rate_baseline_stale: bool = False  # Baseline reading predates the charge
     idle_drain_rate_pct_per_hour: float = DEFAULT_IDLE_DRAIN_RATE
     learned_correction_factor: float = DEFAULT_CORRECTION_FACTOR
@@ -94,6 +95,7 @@ class SocEstimationState:
             "is_idle": self.is_idle,
             "charging_rate_pct_per_hour": self.charging_rate_pct_per_hour,
             "has_measured_rate": self.has_measured_rate,
+            "measured_this_session": self.measured_this_session,
             "rate_baseline_stale": self.rate_baseline_stale,
             "idle_drain_rate_pct_per_hour": self.idle_drain_rate_pct_per_hour,
             "learned_correction_factor": self.learned_correction_factor,
@@ -177,6 +179,9 @@ class SocEstimationState:
             is_idle=bool(data.get("is_idle", False)),
             charging_rate_pct_per_hour=float(charging_rate),
             has_measured_rate=bool(data.get("has_measured_rate", False)),
+            measured_this_session=bool(
+                data.get("measured_this_session", data.get("has_measured_rate", False))
+            ),
             rate_baseline_stale=bool(data.get("rate_baseline_stale", False)),
             idle_drain_rate_pct_per_hour=float(drain_rate),
             learned_correction_factor=float(correction),
@@ -584,7 +589,8 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                             (current_soc - prev_soc) / elapsed, 300.0
                         )
                         self._state.has_measured_rate = True
-                elif not self._state.has_measured_rate and time_to_full is not None:
+                        self._state.measured_this_session = True
+                elif not self._state.measured_this_session and time_to_full is not None:
                     # Track the time-to-full estimate until an observed rate is
                     # available. This also overrides any stale rate carried
                     # over from a previous session. The value the vehicle
@@ -596,6 +602,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                     rate = calculate_charging_rate(current_soc, time_to_full)
                     if rate > 0:
                         self._state.charging_rate_pct_per_hour = rate
+                        self._state.has_measured_rate = False
 
                 # This reading was taken while charging, so it can be timed and
                 # the next one measures a rate from it
@@ -604,8 +611,10 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             else:
                 # Reset the flag so the next charging session can pick up a
                 # fresh time-to-full estimate. The rate itself is preserved
-                # as a fallback for the next session.
-                self._state.has_measured_rate = False
+                # as a fallback for the next session, and stays marked with
+                # where it came from so a carried over measurement is not
+                # mistaken for an estimate and corrected
+                self._state.measured_this_session = False
 
         # Default target SOC to 100% (no target SOC limit for this vehicle type)
         self._state.target_soc = 100.0
