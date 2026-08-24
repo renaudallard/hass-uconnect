@@ -199,15 +199,19 @@ def select_time_to_full(
     """Select the appropriate time-to-full value based on charging_level.
 
     The library reports the level as an integer: 1 for a domestic socket, 2
-    for AC and 3 for DC. Falls back to the shortest value on offer when the
-    level is unknown, that being the most likely active charger.
+    for AC and 3 for DC. A level names the charger that is connected, so when
+    it does and that charger has published nothing usable the answer is
+    nothing: substituting another one can be an order of magnitude out, a
+    domestic socket reading as DC being the case that prompted this. Only an
+    unknown level falls back to the shortest value on offer, that being the
+    most likely active charger. The library reports 0 for DEFAULT, which names
+    no charger and so takes the fallback like a missing level does.
     """
     times: dict[int, float | None] = {1: time_l1, 2: time_l2, 3: time_l3}
 
-    if charging_level is not None:
-        selected = times.get(charging_level)
-        if selected is not None and selected > 0:
-            return selected
+    if charging_level in times:
+        selected = times[charging_level]
+        return selected if selected is not None and selected > 0 else None
 
     valid = [t for t in times.values() if t is not None and t > 0]
     return min(valid) if valid else None
