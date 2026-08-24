@@ -341,9 +341,18 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
 
     @callback
     def reset_learning(self) -> None:
-        """Reset learned correction factor and drain rate to defaults."""
+        """Reset the learned values, including the carried charging rate.
+
+        The rate is kept across sessions so the next one can extrapolate from
+        the first minute, which is exactly wrong after a charger swap, and
+        this button is what a user reaches for then. Clearing it sends the
+        next session back to the vehicle's own time-to-full.
+        """
         self._state.learned_correction_factor = DEFAULT_CORRECTION_FACTOR
         self._state.idle_drain_rate_pct_per_hour = DEFAULT_IDLE_DRAIN_RATE
+        self._state.charging_rate_pct_per_hour = 0.0
+        self._state.has_measured_rate = False
+        self._state.measured_this_session = False
         self.async_write_ha_state()
 
     @callback
