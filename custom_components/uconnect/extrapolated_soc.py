@@ -72,6 +72,7 @@ class SocEstimationState:
     last_vehicle_soc: float | None = (
         None  # Raw SOC from vehicle (not adjusted by lock-in)
     )
+    last_odometer: float | None = None  # Odometer at the baseline reading
     is_charging: bool = False
     is_idle: bool = False  # Not charging and ignition off
     charging_rate_pct_per_hour: float = 0.0
@@ -87,6 +88,7 @@ class SocEstimationState:
         return {
             "last_actual_soc": self.last_actual_soc,
             "last_vehicle_soc": self.last_vehicle_soc,
+            "last_odometer": self.last_odometer,
             "last_actual_soc_time": (
                 self.last_actual_soc_time.isoformat()
                 if self.last_actual_soc_time
@@ -127,6 +129,11 @@ class SocEstimationState:
             last_vehicle_soc = None
         if last_vehicle_soc is not None:
             last_vehicle_soc = max(0.0, min(100.0, last_vehicle_soc))
+
+        # Parse odometer (must be a number or None)
+        last_odometer = data.get("last_odometer")
+        if not isinstance(last_odometer, (int, float)):
+            last_odometer = None
 
         # Parse timestamp (must be timezone-aware for UTC arithmetic)
         last_time = data.get("last_actual_soc_time")
@@ -176,6 +183,7 @@ class SocEstimationState:
             last_vehicle_soc=(
                 float(last_vehicle_soc) if last_vehicle_soc is not None else None
             ),
+            last_odometer=(float(last_odometer) if last_odometer is not None else None),
             is_charging=bool(data.get("is_charging", False)),
             is_idle=bool(data.get("is_idle", False)),
             charging_rate_pct_per_hour=float(charging_rate),
@@ -559,6 +567,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             self._state.last_actual_soc = current_soc
             self._state.last_actual_soc_time = now
             self._state.last_vehicle_soc = current_soc
+            self._state.last_odometer = getattr(self.vehicle, "odometer", None)
 
         # When transitioning from idle to non-idle (car powers on) without
         # fresh SOC data, lock in the accumulated idle drain so native_value
@@ -745,9 +754,28 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         """Learn idle drain rate by comparing actual vs predicted SOC changes.
 
         This helps estimate battery drain when the vehicle is idle (not charging,
-        ignition off).
+        ignition off). The vehicle has to be idle at both ends of the window,
+        since one that has since been driven spent the drop on moving, not on
+        sitting still, and a single drive reads as hundreds of times the drain
+        a parked car has.
         """
-        if self._state.last_actual_soc is None or not was_idle:
+        if (
+            self._state.last_actual_soc is None
+            or not was_idle
+            or not self._state.is_idle
+        ):
+            return
+
+        # Idle at both ends still leaves room for a drive in between when the
+        # vehicle went quiet for a while, and the odometer is the only thing
+        # that can tell. A vehicle that does not report one keeps the weaker
+        # test rather than never learning a drain rate at all
+        odometer = getattr(self.vehicle, "odometer", None)
+        if (
+            odometer is not None
+            and self._state.last_odometer is not None
+            and odometer != self._state.last_odometer
+        ):
             return
 
         elapsed_hours = self._get_elapsed_hours(now)
