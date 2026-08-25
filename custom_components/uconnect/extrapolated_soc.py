@@ -19,6 +19,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import PERCENTAGE
 from homeassistant.core import callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import (
     async_call_later,
     async_track_time_interval,
@@ -53,9 +54,13 @@ MAX_IDLE_DRAIN_RATE = 0.04  # Maximum drain rate (0.04%/hour ≈ 1%/day)
 MIN_IDLE_TIME_FOR_LEARNING_HOURS = 1.0  # Minimum 1 hour idle for learning drain rate
 IDLE_DRAIN_EMA_ALPHA = 0.2  # Slower learning for drain rate (less frequent data points)
 
-# Constants for deep refresh on charging transition
-MAX_DEEP_REFRESH_RETRIES = 3  # Maximum retry attempts for deep refresh
-DEEP_REFRESH_RETRY_SECONDS = 3600  # Retry interval (1 hour)
+# Constants for deep refresh scheduling
+# The vehicle settles on a time-to-full for the connected charger only a
+# couple of minutes after being plugged in
+CHARGE_START_REFRESH_DELAY = timedelta(minutes=3)
+# A command the vehicle never answers ties up the status poll for a minute and
+# some thirty requests, so stop trying once it is clearly not listening
+MAX_DEEP_REFRESH_FAILURES = 3
 
 
 @dataclass
@@ -67,9 +72,13 @@ class SocEstimationState:
     last_vehicle_soc: float | None = (
         None  # Raw SOC from vehicle (not adjusted by lock-in)
     )
+    last_odometer: float | None = None  # Odometer at the baseline reading
     is_charging: bool = False
     is_idle: bool = False  # Not charging and ignition off
     charging_rate_pct_per_hour: float = 0.0
+    has_measured_rate: bool = False  # Stored rate came from observed SOC changes
+    measured_this_session: bool = False  # A rate was measured during this charge
+    rate_baseline_stale: bool = False  # Baseline reading predates the charge
     idle_drain_rate_pct_per_hour: float = DEFAULT_IDLE_DRAIN_RATE
     learned_correction_factor: float = DEFAULT_CORRECTION_FACTOR
     target_soc: float = 100.0
@@ -79,6 +88,7 @@ class SocEstimationState:
         return {
             "last_actual_soc": self.last_actual_soc,
             "last_vehicle_soc": self.last_vehicle_soc,
+            "last_odometer": self.last_odometer,
             "last_actual_soc_time": (
                 self.last_actual_soc_time.isoformat()
                 if self.last_actual_soc_time
@@ -87,6 +97,9 @@ class SocEstimationState:
             "is_charging": self.is_charging,
             "is_idle": self.is_idle,
             "charging_rate_pct_per_hour": self.charging_rate_pct_per_hour,
+            "has_measured_rate": self.has_measured_rate,
+            "measured_this_session": self.measured_this_session,
+            "rate_baseline_stale": self.rate_baseline_stale,
             "idle_drain_rate_pct_per_hour": self.idle_drain_rate_pct_per_hour,
             "learned_correction_factor": self.learned_correction_factor,
             "target_soc": self.target_soc,
@@ -116,6 +129,11 @@ class SocEstimationState:
             last_vehicle_soc = None
         if last_vehicle_soc is not None:
             last_vehicle_soc = max(0.0, min(100.0, last_vehicle_soc))
+
+        # Parse odometer (must be a number or None)
+        last_odometer = data.get("last_odometer")
+        if not isinstance(last_odometer, (int, float)):
+            last_odometer = None
 
         # Parse timestamp (must be timezone-aware for UTC arithmetic)
         last_time = data.get("last_actual_soc_time")
@@ -165,9 +183,15 @@ class SocEstimationState:
             last_vehicle_soc=(
                 float(last_vehicle_soc) if last_vehicle_soc is not None else None
             ),
+            last_odometer=(float(last_odometer) if last_odometer is not None else None),
             is_charging=bool(data.get("is_charging", False)),
             is_idle=bool(data.get("is_idle", False)),
             charging_rate_pct_per_hour=float(charging_rate),
+            has_measured_rate=bool(data.get("has_measured_rate", False)),
+            measured_this_session=bool(
+                data.get("measured_this_session", data.get("has_measured_rate", False))
+            ),
+            rate_baseline_stale=bool(data.get("rate_baseline_stale", False)),
             idle_drain_rate_pct_per_hour=float(drain_rate),
             learned_correction_factor=float(correction),
             target_soc=float(target_soc),
@@ -175,39 +199,40 @@ class SocEstimationState:
 
 
 def select_time_to_full(
-    charging_level: str | int | None,
+    charging_level: int | None,
+    time_l1: float | None,
     time_l2: float | None,
     time_l3: float | None,
 ) -> float | None:
     """Select the appropriate time-to-full value based on charging_level.
 
-    Uses the charging_level sensor to determine which charger is connected,
-    falling back to heuristics if not available.
+    The library reports the level as an integer: 1 for a domestic socket, 2
+    for AC and 3 for DC. A level names the charger that is connected, so when
+    it does and that charger has published nothing usable the answer is
+    nothing: substituting another one can be an order of magnitude out, a
+    domestic socket reading as DC being the case that prompted this. Only an
+    unknown level falls back to the shortest value on offer, that being the
+    most likely active charger. The library reports 0 for DEFAULT, which names
+    no charger and so takes the fallback like a missing level does.
     """
-    valid_l2 = time_l2 is not None and time_l2 > 0
-    valid_l3 = time_l3 is not None and time_l3 > 0
+    times: dict[int, float | None] = {1: time_l1, 2: time_l2, 3: time_l3}
 
-    # Use charging_level to select the right time-to-full
-    if charging_level is not None:
-        # Handle both int and string types
-        level_str = str(charging_level).upper()
-        if "3" in level_str or "DC" in level_str or "FAST" in level_str:
-            if valid_l3:
-                return time_l3
-        elif "2" in level_str or "AC" in level_str:
-            if valid_l2:
-                return time_l2
+    if charging_level in times:
+        selected = times[charging_level]
+        return selected if selected is not None and selected > 0 else None
 
-    # Fallback: use whichever is available
-    if valid_l2 and valid_l3:
-        # Both available - use the smaller one (likely the active charger)
-        assert time_l2 is not None and time_l3 is not None
-        return min(time_l2, time_l3)
-    elif valid_l3:
-        return time_l3
-    elif valid_l2:
-        return time_l2
-    return None
+    valid = [t for t in times.values() if t is not None and t > 0]
+    return min(valid) if valid else None
+
+
+def vehicle_time_to_full(vehicle: Vehicle) -> float | None:
+    """Return the time-to-full for the charger the vehicle reports."""
+    return select_time_to_full(
+        getattr(vehicle, "charging_level", None),
+        getattr(vehicle, "time_to_fully_charge_l1", None),
+        getattr(vehicle, "time_to_fully_charge_l2", None),
+        getattr(vehicle, "time_to_fully_charge_l3", None),
+    )
 
 
 def calculate_charging_rate(
@@ -265,8 +290,8 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
 
         self._state = SocEstimationState()
         self._unsub_timer: Callable[[], None] | None = None
-        self._unsub_deep_refresh_retry: Callable[[], None] | None = None
-        self._has_session_rate: bool = False
+        self._unsub_deep_refresh: Callable[[], None] | None = None
+        self._deep_refresh_failures: int = 0
 
     async def async_added_to_hass(self) -> None:
         """Restore state when added to hass."""
@@ -290,6 +315,11 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         # Initialize with current vehicle state
         self._update_from_vehicle()
 
+        # Resume the deep refresh schedule when Home Assistant restarts during
+        # a charge, the charging state carries over so no transition is seen
+        if self._state.is_charging:
+            self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
+
         # Set up periodic timer for extrapolation updates
         self._unsub_timer = async_track_time_interval(
             self.hass,
@@ -302,16 +332,27 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         if self._unsub_timer:
             self._unsub_timer()
             self._unsub_timer = None
-        if self._unsub_deep_refresh_retry:
-            self._unsub_deep_refresh_retry()
-            self._unsub_deep_refresh_retry = None
+        self._cancel_deep_refresh()
+        # Disabling the entity leaves the config entry loaded, so drop the
+        # registration too or the coordinator keeps handing work to an entity
+        # that is no longer part of Home Assistant
+        self.coordinator.extrapolated_soc_sensors.pop(self._vin, None)
         await super().async_will_remove_from_hass()
 
     @callback
     def reset_learning(self) -> None:
-        """Reset learned correction factor and drain rate to defaults."""
+        """Reset the learned values, including the carried charging rate.
+
+        The rate is kept across sessions so the next one can extrapolate from
+        the first minute, which is exactly wrong after a charger swap, and
+        this button is what a user reaches for then. Clearing it sends the
+        next session back to the vehicle's own time-to-full.
+        """
         self._state.learned_correction_factor = DEFAULT_CORRECTION_FACTOR
         self._state.idle_drain_rate_pct_per_hour = DEFAULT_IDLE_DRAIN_RATE
+        self._state.charging_rate_pct_per_hour = 0.0
+        self._state.has_measured_rate = False
+        self._state.measured_this_session = False
         self.async_write_ha_state()
 
     @callback
@@ -323,49 +364,104 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         ):
             self.async_write_ha_state()
 
-    async def _async_do_deep_refresh(self, attempt: int) -> None:
-        """Execute deep refresh with retry on failure."""
-        _LOGGER.info(
-            "Triggering deep refresh for %s (attempt %d/%d)",
-            self.vehicle.vin,
-            attempt,
-            MAX_DEEP_REFRESH_RETRIES,
-        )
+    async def _async_do_deep_refresh(self) -> None:
+        """Ask the vehicle to push fresh data."""
+        _LOGGER.info("Triggering deep refresh for %s", self._vin)
         try:
-            await self.coordinator.async_command(self.vehicle.vin, COMMAND_DEEP_REFRESH)
+            await self.coordinator.async_command(self._vin, COMMAND_DEEP_REFRESH)
+            self._deep_refresh_failures = 0
         except Exception as err:
+            self._deep_refresh_failures += 1
             _LOGGER.warning(
-                "Deep refresh failed for %s (attempt %d/%d): %s",
-                self.vehicle.vin,
-                attempt,
-                MAX_DEEP_REFRESH_RETRIES,
+                "Deep refresh failed for %s (%d/%d): %s",
+                self._vin,
+                self._deep_refresh_failures,
+                MAX_DEEP_REFRESH_FAILURES,
                 err,
             )
-            if attempt < MAX_DEEP_REFRESH_RETRIES:
-                self._schedule_deep_refresh_retry(attempt + 1)
+            # A refusal is still an answer, and a command the vehicle
+            # answered has already been followed by a read. Only one left
+            # unanswered needs another: the status poll gives up after a
+            # minute, which the vehicle can outlast, so a slow but successful
+            # refresh would be wasted
+            if not isinstance(err, HomeAssistantError):
+                await self.coordinator.async_request_refresh()
+
+    def _can_deep_refresh(self) -> bool:
+        """Check whether an automatic deep refresh can reach the vehicle.
+
+        The command is authenticated with the PIN, which is optional, and is
+        not offered by every vehicle. Every other caller checks this, so
+        without it a charge on an unsupported account queues a command that
+        can only fail.
+        """
+
+        if not self.coordinator.client.api.pin:
+            return False
+
+        vehicle = self.coordinator.client.get_vehicles().get(self._vin)
+        if vehicle is None:
+            return False
+
+        return COMMAND_DEEP_REFRESH.name in vehicle.supported_commands
 
     @callback
-    def _schedule_deep_refresh_retry(self, next_attempt: int) -> None:
-        """Schedule a deep refresh retry after an interval."""
+    def _cancel_deep_refresh(self) -> None:
+        """Cancel a pending deep refresh."""
+        if self._unsub_deep_refresh:
+            self._unsub_deep_refresh()
+            self._unsub_deep_refresh = None
+
+    @callback
+    def _schedule_deep_refresh(self, delay: timedelta) -> None:
+        """Schedule a deep refresh after the given delay."""
+
+        if not self._can_deep_refresh():
+            return
 
         @callback
-        def _retry(_now: datetime) -> None:
-            self._unsub_deep_refresh_retry = None
-            self.hass.async_create_task(self._async_do_deep_refresh(next_attempt))
+        def _fire(_now: datetime) -> None:
+            self._unsub_deep_refresh = None
+            if not self._state.is_charging:
+                return
+            if self._deep_refresh_failures >= MAX_DEEP_REFRESH_FAILURES:
+                _LOGGER.warning(
+                    "Giving up on deep refresh for %s after %d consecutive "
+                    "failures, will try again on the next charging session",
+                    self._vin,
+                    self._deep_refresh_failures,
+                )
+                return
+            interval = self.coordinator.charging_refresh_interval
+            if interval:
+                self._schedule_deep_refresh(timedelta(minutes=interval))
+            self.hass.async_create_task(self._async_do_deep_refresh())
 
-        if self._unsub_deep_refresh_retry:
-            self._unsub_deep_refresh_retry()
-        self._unsub_deep_refresh_retry = async_call_later(
-            self.hass,
-            DEEP_REFRESH_RETRY_SECONDS,
-            _retry,
-        )
-        _LOGGER.info(
-            "Scheduled deep refresh retry %d/%d in 1 hour for %s",
-            next_attempt,
-            MAX_DEEP_REFRESH_RETRIES,
-            self.vehicle.vin,
-        )
+        self._cancel_deep_refresh()
+        self._unsub_deep_refresh = async_call_later(self.hass, delay, _fire)
+
+    @callback
+    def resume_deep_refresh(self) -> None:
+        """Pick the deep refresh back up after the options changed.
+
+        The schedule keeps itself alive from one refresh to the next, so a
+        charge that started with the interval disabled, or without a PIN to
+        authenticate the command, has nothing left to re-arm it and would
+        otherwise wait for the next session.
+        """
+
+        if (
+            self._state.is_charging
+            and self._unsub_deep_refresh is None
+            and self.coordinator.charging_refresh_interval
+        ):
+            # The options may be what the refreshes were failing over, a PIN
+            # the vehicle rejected being the obvious one, so the count of
+            # earlier failures should not bar the retry
+            self._deep_refresh_failures = 0
+            self._schedule_deep_refresh(
+                timedelta(minutes=self.coordinator.charging_refresh_interval)
+            )
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -378,19 +474,13 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         current_soc = getattr(self.vehicle, "state_of_charge", None)
         is_charging = getattr(self.vehicle, "charging", False) or False
         ignition_on = getattr(self.vehicle, "ignition_on", False) or False
-        charging_level = getattr(self.vehicle, "charging_level", None)
-        time_to_full_l2 = getattr(self.vehicle, "time_to_fully_charge_l2", None)
-        time_to_full_l3 = getattr(self.vehicle, "time_to_fully_charge_l3", None)
-
-        # Select the appropriate time-to-full based on charging_level sensor
-        time_to_full = select_time_to_full(
-            charging_level, time_to_full_l2, time_to_full_l3
-        )
+        time_to_full = vehicle_time_to_full(self.vehicle)
 
         now = datetime.now(timezone.utc)
 
         # Track if we're skipping due to stale charging data
         skip_stale_charging_data = False
+        soc_changed = False
 
         if current_soc is not None:
             # Only update baseline if SOC actually changed
@@ -408,11 +498,14 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             is_idle = not is_charging and not ignition_on
 
             # Physical constraint: SOC cannot drop while already charging
-            # Uses stored state (was already charging) not current API state,
-            # so idle→charging transitions with lower SOC from idle drain are accepted
+            # Requires the stored state (was already charging) so that
+            # idle→charging transitions with lower SOC from idle drain are
+            # accepted, and the reported state (still charging) so that a drop
+            # after the charger was unplugged is not rejected forever
             if (
                 soc_changed
                 and self._state.is_charging  # Was already charging
+                and is_charging  # And still is
                 and self._state.last_actual_soc is not None
                 and current_soc < self._state.last_actual_soc
             ):
@@ -461,13 +554,16 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             self._state.is_charging = is_charging
             self._state.is_idle = not is_charging and not ignition_on
 
-        # Always try to learn from SOC changes, even if we don't update baseline
-        # This ensures deep refresh data is used for learning drain rate
-        # But skip learning from stale data
+        # Learn from readings the vehicle actually published, which a deep
+        # refresh makes sure of. A reading either guard rejected is stale by
+        # definition, and it is also never consumed: the baseline does not
+        # move, so the same one would be relearned on every poll until the
+        # extrapolation happens to catch up with it, driving an average that
+        # is meant to be slow straight to whatever that single sample says
         if (
             current_soc is not None
             and self._state.last_actual_soc is not None
-            and not skip_stale_charging_data
+            and soc_changed
         ):
             if current_soc != self._state.last_actual_soc:
                 # Learn correction factor from actual vs predicted changes
@@ -480,6 +576,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
             self._state.last_actual_soc = current_soc
             self._state.last_actual_soc_time = now
             self._state.last_vehicle_soc = current_soc
+            self._state.last_odometer = getattr(self.vehicle, "odometer", None)
 
         # When transitioning from idle to non-idle (car powers on) without
         # fresh SOC data, lock in the accumulated idle drain so native_value
@@ -508,6 +605,25 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                         elapsed_hours,
                     )
 
+        # Restart the measurement window when charging starts, so the first
+        # observed rate is not diluted by the time that passed before the car
+        # was plugged in. Driving to charging leaves the baseline stamped at
+        # the last reading of the drive, which can be well over an hour old
+        if (
+            self._state.is_charging
+            and not was_charging
+            and self._state.last_actual_soc is not None
+        ):
+            # Only the time moves, so the state of charge paired with it can
+            # be older than the timestamp now says. Coming from idle that is
+            # harmless, the reading did not move because the car was parked
+            # and the drain lock-in above has already reconciled the pair.
+            # Coming from a drive it is not: the gain since that reading would
+            # all be credited to the short window after the restamp, so wait
+            # for a reading taken while charging before measuring
+            self._state.rate_baseline_stale = not soc_changed and not was_idle
+            self._state.last_actual_soc_time = now
+
         # Calculate charging rate if charging with valid data
         # Don't recalculate if we detected stale charging data
         # Skip when current_soc is None to preserve restored rate after reboot
@@ -519,6 +635,7 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                 if (
                     was_charging
                     and soc_changed
+                    and not self._state.rate_baseline_stale
                     and prev_soc is not None
                     and prev_soc_time is not None
                     and current_soc - prev_soc >= MIN_SOC_CHANGE_FOR_LEARNING
@@ -528,34 +645,46 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
                         self._state.charging_rate_pct_per_hour = min(
                             (current_soc - prev_soc) / elapsed, 300.0
                         )
-                        self._has_session_rate = True
-                elif not self._has_session_rate and time_to_full is not None:
-                    # Use time-to-full estimate when no observed rate is
-                    # available yet this session. This also overrides any
-                    # stale rate carried over from a previous session.
+                        self._state.has_measured_rate = True
+                        self._state.measured_this_session = True
+                elif not self._state.measured_this_session and time_to_full is not None:
+                    # Track the time-to-full estimate until an observed rate is
+                    # available. This also overrides any stale rate carried
+                    # over from a previous session. The value the vehicle
+                    # reports at plug-in is often a placeholder, so keep taking
+                    # the latest one rather than locking in the first.
                     # Only accept a positive rate so that a zero return
-                    # (e.g. time_to_full < 1 min) does not lock out retries
-                    # or discard a usable stale fallback.
+                    # (e.g. time_to_full < 1 min) does not discard a usable
+                    # stale fallback.
                     rate = calculate_charging_rate(current_soc, time_to_full)
                     if rate > 0:
                         self._state.charging_rate_pct_per_hour = rate
-                        self._has_session_rate = True
+                        self._state.has_measured_rate = False
+
+                # This reading was taken while charging, so it can be timed and
+                # the next one measures a rate from it
+                if soc_changed:
+                    self._state.rate_baseline_stale = False
             else:
-                # Reset session flag so the next charging session can
-                # pick up a fresh time-to-full estimate. The rate itself
-                # is preserved as a fallback for the next session.
-                self._has_session_rate = False
+                # Reset the flag so the next charging session can pick up a
+                # fresh time-to-full estimate. The rate itself is preserved
+                # as a fallback for the next session, and stays marked with
+                # where it came from so a carried over measurement is not
+                # mistaken for an estimate and corrected
+                self._state.measured_this_session = False
 
         # Default target SOC to 100% (no target SOC limit for this vehicle type)
         self._state.target_soc = 100.0
 
-        # Trigger deep refresh on idle-to-charging transition for fresh SOC data
-        if was_idle and not was_charging and self._state.is_charging:
-            _LOGGER.info(
-                "Idle-to-charging transition for %s, triggering deep refresh",
-                self.vehicle.vin,
-            )
-            self.hass.async_create_task(self._async_do_deep_refresh(1))
+        # Deep refresh a few minutes after charging starts, once the vehicle
+        # has settled on a time-to-full for the connected charger. Refreshing
+        # at the very moment the charging flag appears returns the estimate
+        # the vehicle held before the charger was negotiated
+        if self._state.is_charging and not was_charging:
+            self._deep_refresh_failures = 0
+            self._schedule_deep_refresh(CHARGE_START_REFRESH_DELAY)
+        elif was_charging and not self._state.is_charging:
+            self._cancel_deep_refresh()
 
     def _learn_correction_factor(
         self,
@@ -566,11 +695,19 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         """Learn a correction factor by comparing actual vs predicted SOC changes.
 
         This helps account for discrepancies between the vehicle's time-to-full
-        estimate and actual charging behavior.
+        estimate and actual charging behavior. It only applies while the rate
+        comes from that estimate, learning it from a measured rate would drive
+        it towards 1.0 and leave nothing to correct the next estimate with.
+
+        A baseline restamped at charging start is skipped for the same reason
+        the rate measurement skips it: the change since the stored reading did
+        not all happen inside the window the timestamp describes.
         """
         if (
             self._state.last_actual_soc is None
             or not was_charging
+            or self._state.rate_baseline_stale
+            or self._state.has_measured_rate
             or self._state.charging_rate_pct_per_hour <= 0
         ):
             return
@@ -626,9 +763,28 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         """Learn idle drain rate by comparing actual vs predicted SOC changes.
 
         This helps estimate battery drain when the vehicle is idle (not charging,
-        ignition off).
+        ignition off). The vehicle has to be idle at both ends of the window,
+        since one that has since been driven spent the drop on moving, not on
+        sitting still, and a single drive reads as hundreds of times the drain
+        a parked car has.
         """
-        if self._state.last_actual_soc is None or not was_idle:
+        if (
+            self._state.last_actual_soc is None
+            or not was_idle
+            or not self._state.is_idle
+        ):
+            return
+
+        # Idle at both ends still leaves room for a drive in between when the
+        # vehicle went quiet for a while, and the odometer is the only thing
+        # that can tell. A vehicle that does not report one keeps the weaker
+        # test rather than never learning a drain rate at all
+        odometer = getattr(self.vehicle, "odometer", None)
+        if (
+            odometer is not None
+            and self._state.last_odometer is not None
+            and odometer != self._state.last_odometer
+        ):
             return
 
         elapsed_hours = self._get_elapsed_hours(now)
@@ -725,9 +881,15 @@ class UconnectExtrapolatedSocSensor(RestoreEntity, SensorEntity, UconnectEntity)
         if base_soc >= self._state.target_soc:
             return round(base_soc, 1)
 
-        # Calculate extrapolated SOC for charging
+        # Calculate extrapolated SOC for charging. The correction factor
+        # accounts for the vehicle's time-to-full being optimistic or
+        # pessimistic, so it has nothing to correct on a measured rate
         rate = self._state.charging_rate_pct_per_hour
-        correction = self._state.learned_correction_factor
+        correction = (
+            1.0
+            if self._state.has_measured_rate
+            else self._state.learned_correction_factor
+        )
 
         extrapolated = base_soc + (rate * correction * elapsed_hours)
 
@@ -784,6 +946,7 @@ class UconnectChargingRateSensor(SensorEntity, UconnectEntity):
 
         self._soc_history: deque[tuple[datetime, float]] = deque()
         self._observed_rate: float | None = None
+        self._observed_rate_time: datetime | None = None
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -794,6 +957,7 @@ class UconnectChargingRateSensor(SensorEntity, UconnectEntity):
         if not is_charging or current_soc is None:
             self._soc_history.clear()
             self._observed_rate = None
+            self._observed_rate_time = None
             self.async_write_ha_state()
             return
 
@@ -810,10 +974,28 @@ class UconnectChargingRateSensor(SensorEntity, UconnectEntity):
             oldest_time, oldest_soc = self._soc_history[0]
             elapsed_hours = (now - oldest_time).total_seconds() / 3600.0
             delta = current_soc - oldest_soc
-            if elapsed_hours >= MIN_TIME_FOR_LEARNING_HOURS and delta >= 0:
+            # A flat window means the API has not given us a new reading yet,
+            # not that charging has stopped. Publishing the 0%/h it computes
+            # would also suppress the time-to-full fallback below
+            if elapsed_hours >= MIN_TIME_FOR_LEARNING_HOURS and delta > 0:
                 self._observed_rate = min(delta / elapsed_hours, 300.0)
+                self._observed_rate_time = now
 
         self.async_write_ha_state()
+
+    @property
+    def _measurement_is_current(self) -> bool:
+        """Whether the observed rate still describes the window it was taken over.
+
+        Past that it says nothing about the charge now, and a session held at
+        its target would keep reporting the speed it last reached.
+        """
+
+        if self._observed_rate is None or self._observed_rate_time is None:
+            return False
+
+        age = datetime.now(timezone.utc) - self._observed_rate_time
+        return age <= CHARGING_RATE_WINDOW
 
     @property
     def native_value(self) -> float | None:
@@ -823,27 +1005,24 @@ class UconnectChargingRateSensor(SensorEntity, UconnectEntity):
             return 0.0
 
         # Prefer observed rate from actual SOC changes
+        if self._measurement_is_current:
+            return round(self._observed_rate, 1)
+
+        # Fall back to time-to-full estimate for initial reading, and again
+        # once the last measurement has aged out
+        current_soc = getattr(self.vehicle, "state_of_charge", None)
+        time_to_full = vehicle_time_to_full(self.vehicle)
+
+        if current_soc is not None and time_to_full is not None:
+            return round(calculate_charging_rate(current_soc, time_to_full), 1)
+
+        # Nothing current on offer. An aged measurement still beats going
+        # unknown, which is what the vehicle leaves us with when it publishes
+        # neither a new state of charge nor a time-to-full
         if self._observed_rate is not None:
             return round(self._observed_rate, 1)
 
-        # Fall back to time-to-full estimate for initial reading
-        current_soc = getattr(self.vehicle, "state_of_charge", None)
-        if current_soc is None:
-            return None
-
-        charging_level = getattr(self.vehicle, "charging_level", None)
-        time_to_full_l2 = getattr(self.vehicle, "time_to_fully_charge_l2", None)
-        time_to_full_l3 = getattr(self.vehicle, "time_to_fully_charge_l3", None)
-
-        time_to_full = select_time_to_full(
-            charging_level, time_to_full_l2, time_to_full_l3
-        )
-
-        if time_to_full is None:
-            return None
-
-        rate = calculate_charging_rate(current_soc, time_to_full)
-        return round(rate, 1)
+        return None
 
     @property
     def available(self) -> bool:

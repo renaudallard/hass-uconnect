@@ -23,9 +23,12 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
     CONF_BRAND_REGION,
+    CONF_CHARGING_REFRESH_INTERVAL,
     CONF_DISABLE_TLS_VERIFICATION,
     BRANDS,
+    DEFAULT_CHARGING_REFRESH_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
+    MIN_CHARGING_REFRESH_INTERVAL,
     DOMAIN,
 )
 
@@ -44,19 +47,10 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
         self.charge_schedule_data: dict[str, dict] = {}
         self.svla_data: dict[str, dict] = {}
 
-        # Try to get PIN from the options object,
-        # if it's empty there - then from the data object
-        pin_options = config_entry.options.get(CONF_PIN)
-
-        if pin_options is not None and pin_options != "":
-            pin = pin_options
-        else:
-            pin = config_entry.data.get(CONF_PIN)
-
         self.client = Client(
             email=config_entry.data.get(CONF_USERNAME),
             password=config_entry.data.get(CONF_PASSWORD),
-            pin=pin,
+            pin=self._read_pin(config_entry),
             brand=BRANDS_BY_NAME[BRANDS[config_entry.data[CONF_BRAND_REGION]]],
             disable_tls_verification=config_entry.data.get(
                 CONF_DISABLE_TLS_VERIFICATION
@@ -67,6 +61,10 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL) * 60
         )
 
+        self.charging_refresh_interval: int = self._read_charging_refresh_interval(
+            config_entry
+        )
+
         super().__init__(
             hass,
             _LOGGER,
@@ -74,6 +72,35 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(seconds=self.refresh_interval),
             always_update=True,
         )
+
+    @staticmethod
+    def _read_pin(config_entry: ConfigEntry) -> str:
+        """Return the PIN from the options, falling back to the setup value.
+
+        An empty option means the field was left blank rather than cleared, so
+        the PIN given during setup still applies. The API encodes the PIN
+        without checking it, so an absent one is returned as an empty string.
+        """
+
+        return config_entry.options.get(CONF_PIN) or config_entry.data.get(CONF_PIN, "")
+
+    @staticmethod
+    def _read_charging_refresh_interval(config_entry: ConfigEntry) -> int:
+        """Return the deep refresh interval while charging, in minutes.
+
+        Zero disables the recurring refresh. Shorter intervals are raised to
+        the floor because each deep refresh wakes the vehicle and holds an
+        executor thread for as long as the command status poll takes.
+        """
+
+        minutes = config_entry.options.get(
+            CONF_CHARGING_REFRESH_INTERVAL, DEFAULT_CHARGING_REFRESH_INTERVAL
+        )
+
+        if not isinstance(minutes, int) or minutes <= 0:
+            return 0
+
+        return max(minutes, MIN_CHARGING_REFRESH_INTERVAL)
 
     async def _async_update_data(self):
         """Update data via library. Called by update_coordinator periodically."""
@@ -166,3 +193,12 @@ class UconnectDataUpdateCoordinator(DataUpdateCoordinator):
             seconds=config_entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
             * 60
         )
+        self.charging_refresh_interval = self._read_charging_refresh_interval(
+            config_entry
+        )
+        self.client.set_pin(self._read_pin(config_entry))
+
+        # A dormant deep refresh schedule has nothing left to re-arm it, so a
+        # charge already under way has to be told the options allow one now
+        for sensor in self.extrapolated_soc_sensors.values():
+            sensor.resume_deep_refresh()
